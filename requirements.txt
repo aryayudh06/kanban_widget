@@ -1,0 +1,4 @@
+PyQt6>=6.6.0
+supabase>=2.3.0
+keyring>=24.3.0
+pynput>=1.7.6

@@ -52,6 +52,8 @@ class SyncManager(QObject):
         self.user_id: Optional[str] = None
         self._realtime_channel = None
         self._realtime_thread: Optional[threading.Thread] = None
+        self._realtime_stop = threading.Event()
+        self.user_email: Optional[str] = None
 
         # Periodically flush the offline queue. This also acts as our
         # "are we online again yet?" probe -- no separate connectivity
@@ -65,28 +67,36 @@ class SyncManager(QObject):
     # ------------------------------------------------------------------
     def try_restore_session(self) -> bool:
         """Attempt to log in silently using tokens saved in the OS keyring.
-        Returns True if a session was restored."""
-        access_token, refresh_token, _email = TokenVault.load_session()
+        Returns True if a session was restored. The caller starts the
+        board session (see main.Application._start_session)."""
+        access_token, refresh_token, email = TokenVault.load_session()
         if not access_token or not refresh_token:
             return False
         try:
             session = self.client.auth.set_session(access_token, refresh_token)
             if session and session.user:
                 self.user_id = session.user.id
+                self.user_email = session.user.email or email
                 # set_session may have rotated the refresh token; persist the
                 # latest pair so the *next* launch also succeeds.
                 new_session = self.client.auth.get_session()
                 if new_session:
                     TokenVault.save_session(
-                        new_session.access_token, new_session.refresh_token, new_session.user.email or ""
+                        new_session.access_token, new_session.refresh_token, self.user_email or ""
                     )
-                self._start_realtime()
-                self.retry_timer.start()
-                self.auth_state_changed.emit(True)
                 return True
         except Exception as exc:  # noqa: BLE001
             self.sync_error.emit(f"Session restore failed: {exc}")
+            # Tokens that can't be restored are dead -- clear them so the
+            # user gets a clean login prompt instead of a silent loop.
+            TokenVault.clear_session()
         return False
+
+    def start_background_sync(self) -> None:
+        """Starts realtime + the offline-queue retry timer. Called once a
+        session is established and the initial pull is done."""
+        self._start_realtime()
+        self.retry_timer.start()
 
     def sign_in_or_up(self, email: str, password: str, mode: str) -> Optional[tuple[str, str]]:
         """Called from the AuthDialog's callback. Returns (access_token,
@@ -101,21 +111,23 @@ class SyncManager(QObject):
             return None
 
         self.user_id = resp.user.id
+        self.user_email = email
         TokenVault.save_session(resp.session.access_token, resp.session.refresh_token, email)
-        self._start_realtime()
-        self.retry_timer.start()
-        self.auth_state_changed.emit(True)
         return resp.session.access_token, resp.session.refresh_token
 
     def sign_out(self) -> None:
+        """Signs out THIS device only. supabase-py's sign_out() defaults to
+        scope="global", which revokes the refresh tokens of every device
+        signed into the account -- not what a per-device Log out should do."""
         try:
-            self.client.auth.sign_out()
+            self.client.auth.sign_out({"scope": "local"})
         except Exception:
             pass  # best-effort -- we're clearing local state regardless
         TokenVault.clear_session()
         self._stop_realtime()
         self.retry_timer.stop()
         self.user_id = None
+        self.user_email = None
         self.auth_state_changed.emit(False)
 
     # ------------------------------------------------------------------
@@ -159,6 +171,27 @@ class SyncManager(QObject):
             self.client.table(table).update(record).eq("id", change.entity_id).execute()
 
     # ------------------------------------------------------------------
+    # Board discovery -- THE fix for "second device shows an empty board":
+    # boards must be pulled from the cloud before deciding which one to
+    # show, otherwise each new device invents its own empty board.
+    # ------------------------------------------------------------------
+    def pull_boards(self) -> bool:
+        """Copies the account's boards into the local cache. Returns False
+        if the server couldn't be reached (so the caller must NOT create a
+        fresh board -- it may just be offline)."""
+        if not self.user_id:
+            return False
+        try:
+            resp = self.client.table("boards").select("*").execute()
+            for row in resp.data or []:
+                self.local_store.apply_remote_upsert("board", row)
+            return True
+        except Exception as exc:  # noqa: BLE001
+            self.connection_status_changed.emit("offline")
+            self.sync_error.emit(f"Could not fetch boards: {exc}")
+            return False
+
+    # ------------------------------------------------------------------
     # Initial full pull (used right after login / on cold start online)
     # ------------------------------------------------------------------
     def pull_all(self, board_id: str) -> None:
@@ -191,6 +224,7 @@ class SyncManager(QObject):
     def _start_realtime(self) -> None:
         if self._realtime_thread and self._realtime_thread.is_alive():
             return
+        self._realtime_stop = stop_event = threading.Event()
 
         def run() -> None:
             try:
@@ -203,10 +237,7 @@ class SyncManager(QObject):
                 )
                 channel.subscribe()
                 self._realtime_channel = channel
-                # supabase-py's realtime client manages its own asyncio loop
-                # internally once subscribed; this thread just needs to stay
-                # alive to keep that loop's owning thread context valid.
-                threading.Event().wait()
+                stop_event.wait()  # keep the thread alive until logout/exit
             except Exception as exc:  # noqa: BLE001
                 self.sync_error.emit(f"Realtime connection lost: {exc}")
 
@@ -214,12 +245,16 @@ class SyncManager(QObject):
         self._realtime_thread.start()
 
     def _stop_realtime(self) -> None:
+        # Setting the event lets the old thread exit, so a later login
+        # (same or different account) can start a fresh subscription.
+        self._realtime_stop.set()
         if self._realtime_channel is not None:
             try:
                 self.client.remove_channel(self._realtime_channel)
             except Exception:
                 pass
             self._realtime_channel = None
+        self._realtime_thread = None
 
     def _on_column_event(self, payload: dict) -> None:
         self._handle_realtime_payload("column", payload)

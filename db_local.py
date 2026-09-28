@@ -18,8 +18,10 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 import time
 import uuid
+from datetime import datetime, timezone
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any, Iterator, Optional
@@ -87,6 +89,7 @@ class LocalStore:
 
     def __init__(self, db_path: str = LOCAL_DB_PATH):
         self.db_path = db_path
+        self._lock = threading.RLock()  # realtime thread and GUI thread share this connection
         self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL;")
@@ -114,32 +117,75 @@ class LocalStore:
 
     @contextmanager
     def _cursor(self) -> Iterator[sqlite3.Cursor]:
-        cur = self._conn.cursor()
-        try:
-            yield cur
-            self._conn.commit()
-        except Exception:
-            self._conn.rollback()
-            raise
-        finally:
-            cur.close()
+        with self._lock:
+            cur = self._conn.cursor()
+            try:
+                yield cur
+                self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise
+            finally:
+                cur.close()
 
     # ------------------------------------------------------------------
     # Board / column / card reads
     # ------------------------------------------------------------------
-    def get_or_create_default_board(self, title: str = "My Board") -> dict:
+    def get_primary_board(self) -> Optional[dict]:
+        """The board the widget displays: the OLDEST board in the cache.
+        Oldest-first matters when the same account has ended up with more
+        than one board row (e.g. a second device that created its own
+        empty board before this fix) -- the original board holds the data."""
         with self._cursor() as cur:
-            cur.execute("SELECT * FROM boards LIMIT 1;")
-            row = cur.fetchone()
-            if row:
-                return dict(row)
-            board_id = str(uuid.uuid4())
+            cur.execute("SELECT * FROM boards;")
+            boards = [dict(r) for r in cur.fetchall()]
+        if not boards:
+            return None
+        boards.sort(key=lambda b: _parse_ts(b.get("created_at")))
+        return boards[0]
+
+    def create_board(self, title: str = "My Board") -> dict:
+        board_id = str(uuid.uuid4())
+        created = _now_iso()
+        with self._cursor() as cur:
             cur.execute(
                 "INSERT INTO boards (id, title, created_at) VALUES (?, ?, ?);",
-                (board_id, title, _now_iso()),
+                (board_id, title, created),
             )
-            self.enqueue("board", "insert", board_id, {"id": board_id, "title": title})
-            return {"id": board_id, "title": title, "created_at": _now_iso()}
+        self.enqueue("board", "insert", board_id, {"id": board_id, "title": title})
+        return {"id": board_id, "title": title, "created_at": created}
+
+    # ------------------------------------------------------------------
+    # Account binding -- keeps one user's cached data from ever showing
+    # up under another account on the same machine.
+    # ------------------------------------------------------------------
+    def bind_user(self, user_id: str) -> bool:
+        """Associates the cache with `user_id`. If the cache belonged to a
+        different account it is wiped first. Returns True if it was wiped.
+        A cache with no recorded owner (created by an older version) is
+        adopted as-is."""
+        with self._cursor() as cur:
+            cur.execute("SELECT value FROM meta WHERE key = 'user_id';")
+            row = cur.fetchone()
+        owner = row["value"] if row else None
+        wiped = False
+        if owner is not None and owner != user_id:
+            self.clear_all()
+            wiped = True
+        with self._cursor() as cur:
+            cur.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('user_id', ?);", (user_id,))
+        return wiped
+
+    def clear_all(self) -> None:
+        """Deletes every cached row AND the pending sync queue."""
+        with self._cursor() as cur:
+            for table in ("boards", "columns", "cards", "sync_queue", "meta"):
+                cur.execute(f"DELETE FROM {table};")
+
+    def pending_count(self) -> int:
+        with self._cursor() as cur:
+            cur.execute("SELECT COUNT(*) AS n FROM sync_queue;")
+            return int(cur.fetchone()["n"])
 
     def get_columns(self, board_id: str) -> list[dict]:
         with self._cursor() as cur:
@@ -349,6 +395,18 @@ class LocalStore:
 
     def close(self) -> None:
         self._conn.close()
+
+
+def _parse_ts(value: Optional[str]) -> datetime:
+    """Parses both our own '...Z' timestamps and Postgres' '...+00:00' ones so
+    boards created locally and boards pulled from the cloud sort correctly."""
+    if not value:
+        return datetime.max.replace(tzinfo=timezone.utc)
+    try:
+        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except ValueError:
+        return datetime.max.replace(tzinfo=timezone.utc)
 
 
 def _now_iso() -> str:

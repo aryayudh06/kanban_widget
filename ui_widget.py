@@ -499,6 +499,7 @@ class HeaderBar(QFrame):
     close_requested = pyqtSignal()
     add_column_requested = pyqtSignal()
     view_mode_toggle_requested = pyqtSignal()
+    logout_requested = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -535,9 +536,18 @@ class HeaderBar(QFrame):
         self.pin_btn.clicked.connect(self._on_pin_clicked)
         layout.addWidget(self.pin_btn)
 
+        self.logout_btn = QPushButton("Log out")
+        self.logout_btn.setToolTip("Sign out of this device")
+        self.logout_btn.clicked.connect(self.logout_requested.emit)
+        layout.addWidget(self.logout_btn)
+
         close_btn = QPushButton("✕")
         close_btn.clicked.connect(self.close_requested.emit)
         layout.addWidget(close_btn)
+
+    def set_account(self, email: str | None) -> None:
+        self.logout_btn.setToolTip(f"Sign out {email}" if email else "Sign out of this device")
+        self.title_label.setToolTip(email or "")
 
     def set_compact_mode(self, compact: bool) -> None:
         """Concise look when minimized: shrink the title, hide the
@@ -545,6 +555,7 @@ class HeaderBar(QFrame):
         the toggle icon."""
         self.title_label.setText("📋" if compact else "📋 Floating Kanban")
         self.add_col_btn.setVisible(not compact)
+        self.logout_btn.setVisible(not compact)
         self.view_toggle_btn.setText("⛶" if compact else "⤢")
         self.view_toggle_btn.setToolTip("Expand to fullscreen" if compact else "Minimize to compact view")
 
@@ -740,6 +751,8 @@ class CompactSummaryWidget(QFrame):
 # The main floating board window
 # ============================================================================
 class KanbanWindow(QWidget):
+    logout_requested = pyqtSignal()
+
     def __init__(self, local_store: LocalStore, board: dict):
         super().__init__()
         self.local_store = local_store
@@ -792,6 +805,7 @@ class KanbanWindow(QWidget):
         self.header.close_requested.connect(self.hide)
         self.header.add_column_requested.connect(self._on_add_column)
         self.header.view_mode_toggle_requested.connect(self.toggle_view_mode)
+        self.header.logout_requested.connect(self.logout_requested.emit)
         container_layout.addWidget(self.header)
 
         # ---- expanded (fullscreen) content: board + analytics, resizable via a splitter ----

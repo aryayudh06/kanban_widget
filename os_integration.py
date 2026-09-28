@@ -117,6 +117,7 @@ class GlobalHotkeyListener(QObject):
 class TrayIcon(QSystemTrayIcon):
     show_hide_requested = pyqtSignal()
     logout_requested = pyqtSignal()
+    login_requested = pyqtSignal()
     exit_requested = pyqtSignal()
     startup_toggle_requested = pyqtSignal(bool)
 
@@ -146,9 +147,18 @@ class TrayIcon(QSystemTrayIcon):
 
         menu.addSeparator()
 
-        logout_action = QAction("Log out")
-        logout_action.triggered.connect(self.logout_requested.emit)
-        menu.addAction(logout_action)
+        self.account_action = QAction("Not signed in")
+        self.account_action.setEnabled(False)
+        menu.addAction(self.account_action)
+
+        self.login_action = QAction("Sign in...")
+        self.login_action.triggered.connect(self.login_requested.emit)
+        menu.addAction(self.login_action)
+
+        self.logout_action = QAction("Log out")
+        self.logout_action.triggered.connect(self.logout_requested.emit)
+        menu.addAction(self.logout_action)
+        self.set_signed_in(False)
 
         exit_action = QAction("Exit")
         exit_action.triggered.connect(self.exit_requested.emit)
@@ -163,6 +173,13 @@ class TrayIcon(QSystemTrayIcon):
             QSystemTrayIcon.ActivationReason.DoubleClick,
         ):
             self.show_hide_requested.emit()
+
+    def set_signed_in(self, signed_in: bool, email: str | None = None) -> None:
+        self.account_action.setText(f"Signed in as {email}" if signed_in and email else
+                                    ("Signed in" if signed_in else "Not signed in"))
+        self.login_action.setVisible(not signed_in)
+        self.logout_action.setVisible(signed_in)
+        self.show_hide_action.setEnabled(signed_in)
 
     def set_sync_status(self, status: str) -> None:
         icons = {"online": "🟢", "offline": "🔴", "syncing": "🟡"}

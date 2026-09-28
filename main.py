@@ -16,11 +16,11 @@ from __future__ import annotations
 
 import sys
 
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QIcon, QPixmap, QPainter, QColor
 from PyQt6.QtWidgets import QApplication, QMessageBox
 
-from config import APP_NAME
+from config import APP_NAME, SYNC_RETRY_INTERVAL_SECONDS
 from db_local import LocalStore
 from sync_manager import SyncManager
 from security import AuthDialog, confirm_logout
@@ -56,16 +56,23 @@ class Application:
 
         self.window: KanbanWindow | None = None
 
+        # Used when we're signed in but couldn't reach the server on a
+        # device with an empty cache -- we retry instead of inventing a
+        # new (empty) board.
+        self._bootstrap_timer = QTimer()
+        self._bootstrap_timer.setInterval(SYNC_RETRY_INTERVAL_SECONDS * 1000)
+        self._bootstrap_timer.timeout.connect(self._start_session)
+
         self._wire_signals()
 
     def _wire_signals(self) -> None:
-        self.sync_manager.auth_state_changed.connect(self._on_auth_state_changed)
         self.sync_manager.connection_status_changed.connect(self.tray.set_sync_status)
         self.sync_manager.remote_change_applied.connect(self._on_remote_change)
         self.sync_manager.remote_delete_applied.connect(self._on_remote_delete)
         self.sync_manager.sync_error.connect(self._on_sync_error)
 
         self.tray.show_hide_requested.connect(self._toggle_window)
+        self.tray.login_requested.connect(self._show_login)
         self.tray.logout_requested.connect(self._on_logout_requested)
         self.tray.exit_requested.connect(self._on_exit_requested)
         self.tray.startup_toggle_requested.connect(self._on_startup_toggled)
@@ -77,39 +84,92 @@ class Application:
         self.tray.show()
         self.hotkey_listener.start()
 
-        if not self.sync_manager.try_restore_session():
-            self._show_login()
+        if self.sync_manager.try_restore_session():
+            self._start_session()
         else:
-            self._on_auth_state_changed(True)
+            self._show_login()
 
         return self.qapp.exec()
 
     # ------------------------------------------------------------------
+    # Session lifecycle
+    # ------------------------------------------------------------------
     def _show_login(self) -> None:
         dialog = AuthDialog(self.sync_manager.sign_in_or_up)
-        dialog.authenticated.connect(lambda *_: None)  # sign_in_or_up already persisted state
-        if dialog.exec() != dialog.DialogCode.Accepted:
-            # user closed the dialog without signing in -- keep running in
-            # the tray so they can retry, rather than force-quitting.
-            return
+        if dialog.exec() == dialog.DialogCode.Accepted:
+            self._start_session()
+        # If cancelled we keep running in the tray ("Sign in..." is there).
 
-    def _on_auth_state_changed(self, logged_in: bool) -> None:
-        if not logged_in:
-            if self.window:
-                self.window.hide()
-            return
+    def _start_session(self) -> None:
+        """Runs after every successful sign-in / session restore.
 
-        board = self.local_store.get_or_create_default_board()
+        Order matters, and is the fix for "my other device shows an empty
+        board":
+          1. bind the local cache to this account (wipe if it was another's)
+          2. push any pending local edits (so the pull can't overwrite them)
+          3. pull the account's boards from the cloud FIRST
+          4. only create a new board if the cloud genuinely has none
+          5. pull that board's columns/cards, then build the window
+        """
+        user_id = self.sync_manager.user_id
+        if not user_id:
+            return
+        self._bootstrap_timer.stop()
+
+        self.local_store.bind_user(user_id)
+        self.tray.set_signed_in(True, self.sync_manager.user_email)
+
+        self.sync_manager.drain_queue()
+        reached_server = self.sync_manager.pull_boards()
+
+        board = self.local_store.get_primary_board()
+        if board is None:
+            if not reached_server:
+                # Signed in, empty cache, and offline: creating a board now
+                # would fork the account's data. Wait and retry instead.
+                self.tray.setToolTip("Floating Kanban - waiting for connection to load your board...")
+                self._bootstrap_timer.start()
+                return
+            board = self.local_store.create_board("My Board")
+            self.sync_manager.drain_queue()
+
         self.sync_manager.pull_all(board["id"])
 
-        if self.window is None:
-            self.window = KanbanWindow(self.local_store, board)
-        else:
-            self.window.reload_from_local()
-
+        self._close_window()
+        self.window = KanbanWindow(self.local_store, board)
+        self.window.header.set_account(self.sync_manager.user_email)
+        self.window.logout_requested.connect(self._on_logout_requested)
         self.window.show()
-        self.sync_manager.drain_queue()
 
+        self.sync_manager.start_background_sync()
+
+    def _close_window(self) -> None:
+        if self.window is not None:
+            self.window.deadline_timer.stop()
+            self.window.hide()
+            self.window.deleteLater()
+            self.window = None
+
+    def _on_logout_requested(self) -> None:
+        # Try to flush unsynced edits first so logging out doesn't lose them.
+        if self.local_store.pending_count() > 0:
+            self.sync_manager.drain_queue()
+        pending = self.local_store.pending_count()
+
+        if not confirm_logout(self.window, pending):
+            return
+
+        self._bootstrap_timer.stop()
+        self.sync_manager.sign_out()      # this device only; other devices stay signed in
+        self.local_store.clear_all()      # never leave one account's data cached after logout
+        self._close_window()
+        self.tray.set_signed_in(False)
+        self.tray.setToolTip("Floating Kanban")
+        self._show_login()
+
+    # ------------------------------------------------------------------
+    # Realtime + misc handlers
+    # ------------------------------------------------------------------
     def _on_remote_change(self, entity: str, record: dict) -> None:
         if self.window is None:
             return
@@ -132,13 +192,6 @@ class Application:
         if self.window is not None:
             self.window.toggle_visibility()
 
-    def _on_logout_requested(self) -> None:
-        if confirm_logout(None):
-            self.sync_manager.sign_out()
-            if self.window:
-                self.window.hide()
-            self._show_login()
-
     def _on_startup_toggled(self, enabled: bool) -> None:
         success = set_startup_enabled(enabled)
         if not success:
@@ -153,6 +206,7 @@ class Application:
 
     def _on_exit_requested(self) -> None:
         self.hotkey_listener.stop()
+        self.sync_manager.retry_timer.stop()
         self.local_store.close()
         self.qapp.quit()
 

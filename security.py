@@ -189,12 +189,21 @@ class AuthDialog(QDialog):
         self.accept()
 
 
-def confirm_logout(parent) -> bool:
-    """Simple confirmation prompt used by the tray menu's Logout action."""
-    reply = QMessageBox.question(
-        parent,
-        "Log out",
-        "This will remove your saved session from this device. Continue?",
-        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-    )
-    return reply == QMessageBox.StandardButton.Yes
+def confirm_logout(parent, pending_changes: int = 0) -> bool:
+    """Confirmation prompt for Log out. If edits haven't reached the server
+    yet, say so -- logging out clears this device's local cache."""
+    text = "This will sign you out on this device and clear its local copy of your board."
+    if pending_changes > 0:
+        text += (
+            f"\n\n{pending_changes} change(s) have not synced to the server yet and "
+            "will be lost. Connect to the internet and try again to keep them."
+        )
+    else:
+        text += "\nYour data stays safe in your account and will reappear when you sign back in."
+    box = QMessageBox(parent)
+    box.setIcon(QMessageBox.Icon.Warning if pending_changes else QMessageBox.Icon.Question)
+    box.setWindowTitle("Log out")
+    box.setText(text)
+    box.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+    box.setDefaultButton(QMessageBox.StandardButton.No)
+    return box.exec() == QMessageBox.StandardButton.Yes

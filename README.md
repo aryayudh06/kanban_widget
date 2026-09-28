@@ -21,11 +21,7 @@ so it keeps working offline.
    (`supabase_setup.sql`, then this migration) before first launch.
 4. Go to **Project Settings -> API** and copy your **Project URL** and
    **anon public key**.
-5. Create your config for the project
-  ```powershell
-  cp config.example.py config.py
-  ```   
-6. Either edit `config.py` directly, or (recommended) set environment
+4. Either edit `config.py` directly, or (recommended) set environment
    variables before launching:
 
    ```powershell
@@ -64,6 +60,22 @@ python main.py
 * Sign in with the same account on a second machine and edits sync
   within a second or two over Supabase Realtime; anything done offline
   is queued locally and pushed automatically once connectivity returns.
+
+## Signing in on another device / logging out
+
+* On sign-in the app first **pulls your boards from Supabase** and shows
+  your oldest board; it only creates a new board if your account has none.
+  (Earlier builds invented a fresh empty board on every new device, which
+  is why data from another machine didn't appear. Those extra empty
+  "My Board" rows may still exist in your `boards` table - they're
+  harmless and can be deleted in the Supabase Table Editor.)
+* **Log out** is in the widget header (fullscreen view) and in the tray
+  menu. It signs out **this device only** - your other devices stay signed
+  in - and clears this device's local cache and saved credentials. If
+  edits haven't synced yet, the app tries to push them first and warns you
+  if any would be lost. Signing back in restores everything from the cloud.
+* The local cache is tied to the account that created it, so signing in as
+  a different user never shows the previous user's data.
 
 ## Task deadlines, warnings, view modes, analytics, and checklists
 
